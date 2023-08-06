@@ -1,91 +1,71 @@
 ﻿using ChessChallenge.API;
 using System;
+using System.Numerics;
+using System.Collections.Generic;
+using System.Linq;
 
 public class MyBot : IChessBot
 {
     public Move Think(Board board, Timer timer)
     {
-        Random random = new Random();
-        Move[] moves = board.GetLegalMoves();
+        double[] 
+        score_weights = { 2, 0, 1},
+        piece_values = { 0, 1, 4, 5, 5, 9, 10 }; // Piece values: null, pawn, knight, bishop, rook, queen, king
 
-        int search_depth = 5;
 
-        // Piece values:       null, pawn, knight, bishop, rook, queen, king
-        int[] piece_values = { 0, 1, 4, 5, 5, 9, 10 };
+        //int entries = 0;
 
-        void swap(ref double a, ref double b)
+        
+        List<double> rank_moves(List<Move> moves)
         {
-            double t = a;
+            var move_scores = new double[moves.Count];
 
-            a = b;
-            b = t;
-        }
+            int index = 0;
 
-        void quicksort(ref double[] score_array, ref double[] index_array, int l, int h)
-        {
-            if (l < h)
+            foreach (Move move in moves)
             {
-                int t = l - 1;
+                double
+                move_piece_value = piece_values[(int)move.MovePieceType],
+                capture_piece_value = piece_values[(int)move.CapturePieceType];
+                double input_board_values = board_score();
 
-                for (int i = l; i <= h - 1; i++)
-                {
-                    if (score_array[i] <= score_array[h])
-                    {
-                        t++;
-                        swap(ref score_array[i], ref score_array[t]);
-                        swap(ref index_array[i], ref index_array[t]);
-                    }
-                }
+                /*board.MakeMove(move);
+                move_scores[index] += input_board_values - board_score();
+                move_scores[index] += board.IsInCheckmate() ? 100 : 0;
+                board.UndoMove(move);*/
 
-                t++;
-                swap(ref score_array[t], ref score_array[h]);
-                swap(ref index_array[t], ref index_array[h]);
-
-                quicksort(ref score_array, ref index_array, l, t - 1);
-                quicksort(ref score_array, ref index_array, t + 1, h);
-            }
-        }
-
-        double[] sort_moves(ref Move[] input_moves, Board input_board)
-        {
-            double[]
-                move_scores = new double[input_moves.Length],
-                index_array = new double[input_moves.Length];
-
-
-
-            for (int i = 0; i < input_moves.Length; i++)
-            {
-                index_array[i] = i;
-                move_scores[i] = get_move_score(input_board, input_moves[i]);
+                move_scores[index] += capture_piece_value;
+                move_scores[index] += board.SquareIsAttackedByOpponent(move.TargetSquare) ? capture_piece_value - move_piece_value : capture_piece_value;
+                move_scores[index] += board.SquareIsAttackedByOpponent(move.StartSquare) ? move_piece_value : 0;
+                index++;
             }
 
-            quicksort(ref move_scores, ref index_array, 0, input_moves.Length - 1);
-
-            return index_array;
+            return move_scores.ToList();
         }
+        
 
-        double[] get_values(Board input_board)
+        double board_score()
         {
-            double[] output_values = new double[67];
+            double[] values = new double[64];
 
-            foreach (PieceList piece_list in input_board.GetAllPieceLists())
+            double score = 0;
+
+            foreach (PieceList piece_list in board.GetAllPieceLists())
             {
-                PieceType piece_type = piece_list.TypeOfPieceInList;
-                int piece_sign_value = piece_list.IsWhitePieceList ? -1 : 1;
-                int board_sign_value = input_board.IsWhiteToMove ? 1 : -1;
-                output_values[65] += piece_values[(int)piece_type] * piece_list.Count * board_sign_value * piece_sign_value;
+                PieceType current_piece_type = piece_list.TypeOfPieceInList;
+                bool piece_is_white = piece_list.IsWhitePieceList;
+                int sign = (piece_is_white == board.IsWhiteToMove) ? 1 : -1;
 
+                score += piece_values[(int)current_piece_type] * piece_list.Count * sign * score_weights[0];
                 foreach (Piece piece in piece_list)
                 {
-                    PieceType current_piece_type = piece.PieceType;
                     Square current_piece_square = piece.Square;
                     ulong current_bit_board = 0;
 
                     switch (current_piece_type)
                     {
                         case PieceType.Pawn:
-                            current_bit_board = BitboardHelper.GetPawnAttacks(current_piece_square, piece_list.IsWhitePieceList);
+                            current_bit_board = BitboardHelper.GetPawnAttacks(current_piece_square, piece_is_white);
                             break;
                         case PieceType.Knight:
                             current_bit_board = BitboardHelper.GetKnightAttacks(current_piece_square);
@@ -96,122 +76,128 @@ public class MyBot : IChessBot
                         case PieceType.Bishop:
                         case PieceType.Rook:
                         case PieceType.Queen:
-                            current_bit_board = BitboardHelper.GetSliderAttacks(current_piece_type, current_piece_square, input_board.AllPiecesBitboard);
+                            current_bit_board = BitboardHelper.GetSliderAttacks(current_piece_type, current_piece_square, board.AllPiecesBitboard);
                             break;
                     }
 
-                    for (int i = 0; i < 64; i++)
-                        output_values[i] += (((long)current_bit_board & ((Int64)1 << i)) != 0 ? 1 : 0) * piece_sign_value * board_sign_value;
+                    for (int i = 0; i < 64; i++) values[i] += (((long)current_bit_board & ((long)1 << i)) != 0 ? 1 : 0) * sign;
+
                 }
             }
 
-            for (int i = 0; i < 64; i++)
+            foreach (double value in values) score += value * score_weights[1] + Math.Clamp(value, -1, 1) * score_weights[2]; 
+
+
+
+            score += board.IsInCheckmate() ? 100 : (board.IsDraw() ? -50 : 0);
+
+            return score;
+        }
+
+
+        double minimax(ref Move best_move, int depth, int max_depth, bool maximizer, double alpha = double.MinValue, double beta = double.MaxValue)
+        {
+            //entries++;
+
+            if (depth == 0 || board.IsInCheckmate() || board.IsDraw()) return board_score();
+
+            depth--;
+
+            double best = maximizer ? double.MinValue : double.MaxValue;
+
+            var moves = board.GetLegalMoves().ToList();
+            var move_rankings = rank_moves(moves);
+
+            do
             {
-                output_values[64] += output_values[i];
-                output_values[66] += Math.Clamp(output_values[i], -1, 1);
+                int move_index = move_rankings.IndexOf(move_rankings.Max());
+
+                Move move = moves[move_index];
+                move_rankings.RemoveAt(move_index);
+                moves.RemoveAt(move_index);
+
+                board.MakeMove(move);
+
+                double score = minimax(ref best_move, depth, max_depth, !maximizer, alpha, beta);
+
+                best = maximizer ? Math.Max(best, score) : Math.Min(best, score);
+
+                board.UndoMove(move);
+
+                best_move = ((best == score) && depth == max_depth - 1) ? move : best_move;
+                //best_move = (best == score) ? move : best_move;
+
+                if (maximizer ? beta < best : alpha > best) break;
+
+                alpha = maximizer ? Math.Max(alpha, best) : alpha;
+                beta = !maximizer ? Math.Min(beta, best) : beta;
+
+                //if (beta <= alpha) break;
+            } while (move_rankings.Count > 0);
+
+            return best;
+        }
+
+        //Console.WriteLine(minimax(true, 4, -1000, 1000) + " " + board_score(board) + " " + entries);
+
+        //Console.WriteLine();
+
+
+        // Find the next move
+        /*double best_score = -1000;
+
+        foreach (Move move in moves)
+        {
+            int search_depth = 3;
+
+            entries = 0;
+            board.MakeMove(move);
+
+            if (board.IsInCheckmate()) return move;
+
+            //if (move.CapturePieceType != PieceType.None && timer.MillisecondsRemaining > 2000) search_depth++;
+
+            double score = search(3, true);
+
+            if (best_score < score)
+            {
+                next_move = move;
+                best_score = score;
             }
 
-            return output_values;
-        }
+            board.UndoMove(move);
 
-        double get_score(Board input_board)
+            Console.WriteLine(entries);
+        }*/
+
+        /*  Iterative Search  */
+        Move next_move = Move.NullMove;
+
+        /*double best = -1000;
+        double alpha = double.MinValue, beta = double.MaxValue;
+        int search_depth = 4;
+
+        for (int i = 1; i <= search_depth; i++)
         {
-            double[] board_values = get_values(input_board);
 
-            return
-                (
-                board_values[64] / 3 + // square control
-                board_values[65] * 2 + // piece difference
-                board_values[66] / 2 + // board control
-                (input_board.IsInCheckmate() ? 100 : 0) +
-                (input_board.IsDraw() ? -50 : 0) +
-                (input_board.IsInCheck() ? 2 : 0)
-                );
-        }
+            //Move move = Move.NullMove;
+            double score = minimax(ref next_move, i, i, true, alpha, beta);
 
-        double get_move_score(Board input_board, Move next_move)
-        {
-            double
-                move_score = 0,
-                move_piece_value = piece_values[(int)next_move.MovePieceType],
-                capture_piece_value = piece_values[(int)next_move.CapturePieceType];
-            double[] input_board_values = get_values(input_board);
+            best = Math.Max(best, score);
 
-            input_board.MakeMove(next_move);
-            move_score += get_values(input_board)[64] - input_board_values[64];
-            move_score += get_values(input_board)[65] - input_board_values[65];
-            //move_score -= get_values(input_board)[next_move.TargetSquare.Index];
-            move_score += input_board.IsInCheckmate() ? 100 : 0;
-            //move_score -= get_values(input_board)[next_move.StartSquare.Index] * move_piece_value;
-            input_board.UndoMove(next_move);
+            //next_move = (score == best) ? move : next_move;
 
-            //move_score += capture_piece_value;
-            //move_score += input_board.SquareIsAttackedByOpponent(next_move.TargetSquare) ? capture_piece_value - move_piece_value : capture_piece_value;
-            move_score += input_board.SquareIsAttackedByOpponent(next_move.StartSquare) ? move_piece_value : 0;
+            //if (best == score) Console.WriteLine(best + " " + score);
+        }*/
 
-            return move_score;
-        }
+        Console.WriteLine(minimax(ref next_move, 4, 4, true));
 
-        double[] minimax(int depth, int index, bool maximizer, int origin_index, double alpha, double beta, int max_depth, Board input_board)
-        {
-            Move[] input_moves = input_board.GetLegalMoves();
-
-            //Console.WriteLine(max_depth);
-
-            if (timer.MillisecondsRemaining <= 20000 || input_board.GetLegalMoves(true).Length == 0) max_depth = 3;
-
-            if (depth == 1) origin_index = index;
-
-            if (depth >= max_depth || input_board.IsInCheckmate() || input_board.IsDraw()) return new double[2] { get_score(input_board), origin_index}; 
-
-            double[] 
-                best_result = new double[2],
-                current_result = new double[2];
-
-            best_result[0] = maximizer ? -1000 : 1000;
-
-            double[] index_array = sort_moves(ref input_moves, input_board);
-
-            depth += 1;
-            for (int i = input_moves.Length - 1; i >= 0; i--)
-            {
-                int current_index = (int)index_array[i];
-
-                input_board.MakeMove(input_moves[current_index]);
-
-                //if (input_moves[current_index].CapturePieceType == PieceType.None) max_depth = 3;
-
-                //max_depth = (input_moves[current_index].CapturePieceType != PieceType.None) ? 5 : 3;
-
-                current_result = minimax(depth, current_index, !maximizer, origin_index, alpha, beta, max_depth, input_board);
-                best_result[0] = maximizer ? Math.Max(best_result[0], current_result[0]) : Math.Min(best_result[0], current_result[0]);
-                best_result[1] = current_result[0] == best_result[0] ? current_result[1] : best_result[1];
-
-                input_board.UndoMove(input_moves[current_index]);
-
-                bool skip = maximizer ? best_result[0] > beta : best_result[0] < alpha;
-
-                if (skip) break;
-
-                alpha = maximizer ? Math.Max(alpha, best_result[0]) : alpha;
-                beta = !maximizer ? Math.Min(beta, best_result[0]) : beta;
-            }
-
-            return best_result;
-        }
+        //Console.WriteLine(entries);
 
 
-        double[] minimax_values = minimax(0, 0, true, 0, -1000, 1000, search_depth, board);
+        var rand = new Random();
 
-        //Console.WriteLine(checkmate_number);
-
-        //Console.WriteLine(minimax_values[0] + " " + minimax_values[1]);
-
-        //Console.WriteLine(get_values(board)[64] + " " + get_values(board)[65] + " " + get_values(board)[66]);
-
-        Move next_move = moves[(int)minimax_values[1]];
-
-        //Console.WriteLine(get_move_score(board, next_move));
+        next_move = (next_move == Move.NullMove) ? board.GetLegalMoves()[rand.Next(board.GetLegalMoves().Length)] : next_move;
 
         return next_move;
     }

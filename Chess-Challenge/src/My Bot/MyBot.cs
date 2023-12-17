@@ -1,128 +1,173 @@
 ﻿using ChessChallenge.API;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.Contracts;
 using System.Linq;
-using System.Net;
-using System.Runtime.InteropServices;
-using static System.Formats.Asn1.AsnWriter;
+using System.Text.Json;
+using System.Transactions;
+using System.Xml.Serialization;
 
 public class MyBot : IChessBot
 {
+    Random random = new();
+    int[] piece_scores = { 0, 70, 310, 330, 500, 790, 1000 };
+
+    public int board_score(Board board)
+    {
+        int score = 0;
+
+        score += (Convert.ToInt32(board.IsInCheckmate()) * 100 - Convert.ToInt32(board.IsDraw()) * 100);
+
+
+
+        for (int i = 0; i < 64; i++)
+        {
+            Piece current_piece = board.GetPiece(new(i));
+            //if (current_piece.IsNull) continue;
+
+            int perspective = (current_piece.IsWhite != board.IsWhiteToMove) ? 1 : -1;
+
+
+            score += piece_scores[(int)current_piece.PieceType] * perspective;
+        }
+
+        return score;
+    }
+
+    public class Node
+    {
+        public int
+            visits,
+            value;
+
+        public Board board;
+
+        public Node parent, root;
+
+        public List<Node> children;
+
+        public Node(ref Board t_board, ref Node t_parent, ref Node t_root)
+        {
+            board = t_board;
+
+            visits = 0;
+            value = 0;
+
+            parent = t_parent;
+            root = t_root;
+            children = new List<Node>();
+        }
+
+        public float children_average()
+        {
+            float result = 0;
+
+            foreach(Node child in children)
+            {
+                result += child.value;
+            }
+
+            result /= children.Count;
+
+            return result;
+         }
+
+        public static Node Null;
+    }
+
+    public Node best_child_ucb(Node parent)
+    {
+        Node best_child = parent.children[0];
+
+        double best_ucb = double.MinValue;
+        foreach (Node child in parent.children)
+        {
+            double ucb = child.visits == 0 ? double.MaxValue : parent.children_average() + 2 * Math.Sqrt(Math.Log(parent.visits) / child.visits);
+
+            if (ucb > best_ucb) { best_ucb = ucb;  best_child = child; }
+        }
+
+        return best_child;
+    }
+
+    public int rollout_node(Board board, ref int depth)
+    {
+        depth++;
+        var moves = board.GetLegalMoves();
+
+        if (board.IsDraw() || board.IsInCheckmate()) return board_score(board);
+
+        var move = moves[random.Next(moves.Length)];
+
+        board.MakeMove(move);
+        int result = rollout_node(board, ref depth);
+        board.UndoMove(move);
+
+        return result;
+    }
+
+    public void extend_node(ref Node parent, Board board)
+    {
+        var moves = board.GetLegalMoves();
+
+        foreach (Move move in moves)
+        {
+            board.MakeMove(move);
+
+            parent.children.Add(new(ref board, ref parent, ref parent.root));
+
+            board.UndoMove(move);
+        }
+    }
+
     public Move Think(Board board, Timer timer)
     {
-        ulong[] bitboards = {103481868288, 66125924401152}; // Center, Center Outline
-        float[,] piece_scores = { { 0, 0.7f, 3.1f, 3.3f, 5.0f, 7.9f, 2.2f}, {0, 1.3f, 3.1f, 3.3f, 5.0f, 7.9f, 2.2f}}; // None, Pawn, Knight, Bishop, Rook, Queen, King
-        float[] weights = { 3f, 0.5f, 0f,  1f, 0f}; // Piece Count, Board Control, Center Control, King Danger, Center Outline
-        //BitboardHelper.VisualizeBitboard(bitboards[1]);
-
-        var transposition_table = new Dictionary<ulong, (float, Move[])>();
-
+        
         Move best_move = Move.NullMove;
-        int evaluations = 0;
 
-        float board_score(int depth = 1, bool debug = false)
-        { 
-            float score = 0;
+        Node current = new(ref board, ref Node.Null, ref Node.Null);
+        current.root = current;
 
-            ulong current_bitboard = board.IsWhiteToMove? board.WhitePiecesBitboard : board.BlackPiecesBitboard;
-
-            for (int i = 0; i < 64; i++)
-            {
-                Piece current_piece = board.GetPiece(new Square(i));
-                if (current_piece.IsKing) continue;
-                ulong piece_bitboard = BitboardHelper.GetPieceAttacks(current_piece.PieceType, current_piece.Square, board, current_piece.IsWhite);
-                float perspective = (current_piece.IsWhite != board.IsWhiteToMove) ? 1 : -1;
-
-
-                score += 
-                    BitboardHelper.GetNumberOfSetBits(piece_bitboard) * weights[1] * perspective /*+
-                    BitboardHelper.GetNumberOfSetBits(piece_bitboard & bitboards[0]) * weights[2] * perspective +
-                    BitboardHelper.GetNumberOfSetBits(piece_bitboard & bitboards[1]) * weights[4] * perspective*/;
-                    
-
-                current_bitboard |= piece_bitboard;
-
-                score += piece_scores[0, (int)current_piece.PieceType] * perspective * weights[0];
-            }
-
-            //score -= BitboardHelper.GetNumberOfSetBits(current_bitboard & BitboardHelper.GetKingAttacks(board.GetKingSquare(board.IsWhiteToMove))) * weights[3];
-
-            score += (Convert.ToInt32(board.IsInCheckmate()) * 100f - Convert.ToInt32(board.IsDraw()) * 50f)/* - depth*/;
-
-            return -score;
-        }
-
-        int same_move_value = 0;
-        ulong same_move_bitboard = 0;
-
-        bool checkmate_found = false;
-        int checkmate_depth = int.MaxValue;
-
-        float minimax(int search_depth, int depth = 0, float alpha = float.MinValue, float beta = float.MaxValue, bool extend = false)
+        while (timer.MillisecondsElapsedThisTurn < 1000)
         {
-            evaluations++;
-
-            if (!transposition_table.ContainsKey(board.ZobristKey)) transposition_table[board.ZobristKey] = (board_score(depth), board.GetLegalMoves());
-
-            var current_table = transposition_table[board.ZobristKey];
-
-            float evaluation = current_table.Item1;
-            var moves = current_table.Item2;
-
-            if (extend)
+            if (current.children.Count == 0) // Is leaf node
             {
-                alpha = Math.Max(alpha, evaluation);
-                if (evaluation >= beta) return beta;
-            }
-
-            //if (evaluation > 20) search_depth = 5;
-
-            if (depth == search_depth) return minimax(search_depth, depth + 1, alpha, beta, true); // Extended Minimax
-
-            //var indexes = order_moves(moves);
-
-            /*foreach (int index in indexes)
-            {
-                Move move = moves[index];*/
-
-            foreach (Move move in moves)
-            { 
-                if (extend && (!move.IsCapture || depth == checkmate_depth || depth == 11 || timer.MillisecondsRemaining <= 20000) && !board.IsInCheck()) continue;
-
-                board.MakeMove(move);
-                if (board.IsInCheckmate() && depth % 2 == 1)
+                if (current.visits == 0) // Run rollout
                 {
-                    checkmate_depth = Math.Min(checkmate_depth, depth);
-                    checkmate_found = true;
+                    int depth = 0;
+                    int result = rollout_node(current.board, ref depth);
+
+                    current.value = result;
+                    current.visits += 1;
+
+                    if (current.root != null)
+                    {
+                        current.root.visits += 1;
+                        current.root.value += result;
+                    }
+
+
+                    /*if (current.parent != null)
+                    {
+                        current.parent.visits++;
+                    }*/
                 }
-                evaluation = -minimax(search_depth, depth + 1, -beta, -alpha, extend); // Switch Sides
-                board.UndoMove(move);
-
-                if (alpha >= beta) return beta;
-
-                if (alpha < evaluation && depth == 0)
+                else
                 {
-                    same_move_bitboard = 0;
-                    same_move_value = 0;
-                    best_move = move;
-                }
-
-
-                alpha = Math.Max(evaluation, alpha);
-
-                if (alpha == evaluation && depth == 0)
-                {
-                    BitboardHelper.SetSquare(ref same_move_bitboard, move.StartSquare);
-                    same_move_value++;
+                    extend_node(ref current, board);
                 }
             }
+            else
+            {
+                current = best_child_ucb(current);
+            }
 
-            return alpha;
+            
         }
 
-        Console.WriteLine(minimax(3) + " " + evaluations + " " + board_score() + " " + same_move_value + " " + checkmate_found + " " + checkmate_depth);
-        //BitboardHelper.VisualizeBitboard(same_move_bitboard);
+        Console.WriteLine(current.root.children.Count);
 
+        //return board.GetLegalMoves()[random.Next(0, board.GetLegalMoves().Length - 1)];
         return best_move;
     }
 }

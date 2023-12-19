@@ -1,173 +1,191 @@
 ﻿using ChessChallenge.API;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics.Contracts;
 using System.Linq;
-using System.Text.Json;
-using System.Transactions;
-using System.Xml.Serialization;
 
 public class MyBot : IChessBot
 {
-    Random random = new();
-    int[] piece_scores = { 0, 70, 310, 330, 500, 790, 1000 };
+    Random random;
 
-    public int board_score(Board board)
+    static int[] PIECE_SCORES = { 0, 70, 310, 330, 500, 790, 0 };
+    static int PIECE_SCORES_TOTAL = PIECE_SCORES.Sum();
+    static int SEARCH_DEPTH = 2;
+    static int CHECKMATE_SCORE = 10000;
+
+    static Dictionary<string, KeyValuePair<int, Move[]>> MoveTranspositionTable = new Dictionary<string, KeyValuePair<int, Move[]>>();
+    static Dictionary<ulong, int> ScoreTranspositionTable = new Dictionary<ulong, int>();
+
+    int entries = 0;
+
+    private int boardState(Board board, bool isWhite = false, int depth = 0)
     {
-        int score = 0;
-
-        score += (Convert.ToInt32(board.IsInCheckmate()) * 100 - Convert.ToInt32(board.IsDraw()) * 100);
+        bool isMyTurn = board.IsWhiteToMove == isWhite;
 
 
+        double time = Math.Pow((depth + 1) / SEARCH_DEPTH, 0.5);
 
-        for (int i = 0; i < 64; i++)
-        {
-            Piece current_piece = board.GetPiece(new(i));
-            //if (current_piece.IsNull) continue;
-
-            int perspective = (current_piece.IsWhite != board.IsWhiteToMove) ? 1 : -1;
-
-
-            score += piece_scores[(int)current_piece.PieceType] * perspective;
-        }
-
-        return score;
+        return (isMyTurn ? -1 : 1) * ((board.IsInCheckmate() ? (int)(CHECKMATE_SCORE * time) : 0) - (board.IsDraw() ? 900 : 0) - (board.IsRepeatedPosition() ? 200 : 0));
     }
-
-    public class Node
+    private int boardScore(Board board, bool isWhite, bool debug = false)
     {
-        public int
-            visits,
-            value;
+        bool isMyTurn = board.IsWhiteToMove == isWhite;
 
-        public Board board;
-
-        public Node parent, root;
-
-        public List<Node> children;
-
-        public Node(ref Board t_board, ref Node t_parent, ref Node t_root)
+        if (!ScoreTranspositionTable.ContainsKey(board.ZobristKey))
         {
-            board = t_board;
+            entries++;
+            float score = 0;
 
-            visits = 0;
-            value = 0;
+            var bitPieceControl = new int[2] { 0, 0 };
+            var bitPieceBoardControl = new ulong[2] { isWhite ? board.WhitePiecesBitboard : board.BlackPiecesBitboard, isWhite ? board.BlackPiecesBitboard : board.WhitePiecesBitboard};
+            var bitPieceTypeControl = new Dictionary<int, ulong> { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 }, { 4, 0 }, { 5, 0 }, { 6, 0 } };
+            var bitBoardControl = new ulong[2] { 0, 0 };
 
-            parent = t_parent;
-            root = t_root;
-            children = new List<Node>();
-        }
+            ulong pieceLocationBitboard = 0;
 
-        public float children_average()
-        {
-            float result = 0;
-
-            foreach(Node child in children)
+            foreach (var pieceList in board.GetAllPieceLists())
             {
-                result += child.value;
+                bool isMyPiece = pieceList.IsWhitePieceList == isWhite;
+                foreach (var piece in pieceList)
+                {
+                    pieceLocationBitboard = 0;
+
+                    bitPieceControl[isMyPiece ? 0 : 1] += PIECE_SCORES[(int)piece.PieceType]; // Gets the total piece control for each side
+                    bitBoardControl[isMyPiece ? 0 : 1] |= BitboardHelper.GetPieceAttacks(piece.PieceType, piece.Square, board, piece.IsWhite); // Gets the total board control for each side
+                    
+                    pieceLocationBitboard = bitPieceTypeControl[(int)piece.PieceType];
+                    BitboardHelper.SetSquare(ref pieceLocationBitboard, piece.Square);
+                    bitPieceTypeControl[(int)piece.PieceType] |= pieceLocationBitboard;
+                }
             }
 
-            result /= children.Count;
+            score += bitPieceControl[0] - bitPieceControl[1]; // Score Difference
+            score += BitboardHelper.GetNumberOfSetBits(bitBoardControl[0] ^ (bitPieceBoardControl[1] & bitPieceBoardControl[0])) / 2; // Spaces controlled
+            score += BitboardHelper.GetNumberOfSetBits(bitBoardControl[0] & bitPieceBoardControl[0]) * 2; // Pieces that you control
+            score += BitboardHelper.GetNumberOfSetBits(bitBoardControl[0] & (bitPieceBoardControl[1] ^ (bitBoardControl[1] & bitPieceBoardControl[1]))); // Gets their pieces that you have control of that they are not controlling
+            score -= BitboardHelper.GetNumberOfSetBits(bitBoardControl[1] & (bitPieceBoardControl[0] ^ (bitBoardControl[0] & bitPieceBoardControl[0]))) / 2; // Gets your pieces that they have control of that you are not controlling
+            //score += BitboardHelper.GetNumberOfSetBits(bitBoardControl[0] & bitPieceBoardControl[1]); // Gets their pieces that you have control of
+            //score += BitboardHelper.GetNumberOfSetBits(bitBoardControl[0] & (bitPieceBoardControl[1] | bitPieceBoardControl[0])); // Pieces that you control
+            //score += BitboardHelper.GetNumberOfSetBits(~bitPieceBoardControl[0] & (bitBoardControl[0] ^ (bitBoardControl[1] & bitBoardControl[0]))); // Gets the squares that you have complete control of
 
-            return result;
-         }
+            foreach ((int pieceType, ulong pieceTypeControl) in bitPieceTypeControl)
+            {
+                //score -= pieceType * BitboardHelper.GetNumberOfSetBits(bitBoardControl[1] & bitPieceBoardControl[0]); // Gets your pieces that they have control of
+                //score -= pieceType * BitboardHelper.GetNumberOfSetBits(pieceTypeControl & (bitBoardControl[0] ^ (bitBoardControl[0] | bitPieceBoardControl[0]))); // Gets your pieces that you don't have control of
+                //score -= pieceType * BitboardHelper.GetNumberOfSetBits(pieceTypeControl & (bitBoardControl[1] & (bitPieceBoardControl[0] ^ (bitBoardControl[0] & bitPieceBoardControl[0])))); // Gets your pieces that they have control of that you are not controlling
+                //score += pieceType * BitboardHelper.GetNumberOfSetBits(pieceTypeControl & (bitBoardControl[0] & (bitPieceBoardControl[1] | bitPieceBoardControl[0]))); // Pieces that you control
+            }
 
-        public static Node Null;
-    }
 
-    public Node best_child_ucb(Node parent)
-    {
-        Node best_child = parent.children[0];
+            score -= (isMyTurn ? 1 : -1) * (board.IsInCheck() ? 10 : 0);
 
-        double best_ucb = double.MinValue;
-        foreach (Node child in parent.children)
-        {
-            double ucb = child.visits == 0 ? double.MaxValue : parent.children_average() + 2 * Math.Sqrt(Math.Log(parent.visits) / child.visits);
+            if (debug)
+            {
+                //Console.WriteLine("0: " + bitPieceControl[0].ToString() + " 1: " + bitPieceControl[1].ToString() + " D: " + (bitPieceControl[0] - bitPieceControl[1]).ToString());
+                Console.WriteLine("score: " + score.ToString());
+                //BitboardHelper.VisualizeBitboard(bitBoardControl[0] & (bitPieceBoardControl[1] ^ (bitBoardControl[1] & bitPieceBoardControl[1])));
+                BitboardHelper.VisualizeBitboard(bitBoardControl[1] & (bitPieceBoardControl[0] ^ (bitBoardControl[0] & bitPieceBoardControl[0])));
+            }
 
-            if (ucb > best_ucb) { best_ucb = ucb;  best_child = child; }
+            ScoreTranspositionTable.Add(board.ZobristKey, (int)score);
         }
 
-        return best_child;
+        return ScoreTranspositionTable[board.ZobristKey];
     }
 
-    public int rollout_node(Board board, ref int depth)
+    private Move[] getOrderedMoves(Board board, bool catpuresOnly = false)
     {
-        depth++;
-        var moves = board.GetLegalMoves();
+        var moveOrderScore = new Dictionary<Move, int>();
+        foreach (Move move in board.GetLegalMoves(catpuresOnly))
+        {
+            int score = 0;
 
-        if (board.IsDraw() || board.IsInCheckmate()) return board_score(board);
+            score += PIECE_SCORES[(int)move.CapturePieceType];
+            score += PIECE_SCORES[(int)move.MovePieceType] * (move.IsCapture ? 1 : 0);
+            score += PIECE_SCORES[(int)move.MovePieceType];
 
-        var move = moves[random.Next(moves.Length)];
+            //score -= BitboardHelper.GetNumberOfSetBits(BitboardHelper.GetPieceAttacks(move.MovePieceType, move.StartSquare, board, board.IsWhiteToMove));
 
-        board.MakeMove(move);
-        int result = rollout_node(board, ref depth);
-        board.UndoMove(move);
+            moveOrderScore.Add(move, score);
+        }
 
-        return result;
+        return (from entry in moveOrderScore orderby entry.Value descending select entry.Key).ToArray();
     }
 
-    public void extend_node(ref Node parent, Board board)
+    private KeyValuePair<int, Move[]> Evaluate(Board board, Timer timer, int depth, bool isWhite, bool capturesOnly = false, int alpha = int.MinValue, int beta = int.MaxValue)
     {
-        var moves = board.GetLegalMoves();
+        if (MoveTranspositionTable.ContainsKey(board.GetFenString())) { return MoveTranspositionTable[board.GetFenString()]; }
 
-        foreach (Move move in moves)
+        bool myTurn = board.IsWhiteToMove == isWhite;
+
+        if (depth == 0 || board.IsDraw() || board.IsInCheckmate()) { 
+            return new KeyValuePair<int, Move[]>( (myTurn ? 1 : -1) * (boardScore(board, board.IsWhiteToMove) + boardState(board, board.IsWhiteToMove, depth)), Array.Empty<Move>()); 
+        }
+        
+        if (myTurn) { depth--; }
+        var best = new KeyValuePair<int, Move[]>( myTurn ? int.MinValue : int.MaxValue, Array.Empty<Move>());
+
+        foreach (Move move in getOrderedMoves(board, capturesOnly))
         {
             board.MakeMove(move);
-
-            parent.children.Add(new(ref board, ref parent, ref parent.root));
-
+            var result = Evaluate(board, timer, depth, isWhite, capturesOnly, alpha, beta);
+            /*if (MoveTranspositionTable.ContainsKey(board.GetFenString())) { result = MoveTranspositionTable[board.GetFenString()]; }
+            else { result = Evaluate(board, timer, depth, isWhite, capturesOnly, alpha, beta); }*/
+            MoveTranspositionTable.TryAdd(board.GetFenString(), result);
+            var evaluation = result.Key;
             board.UndoMove(move);
-        }
-    }
 
-    public Move Think(Board board, Timer timer)
-    {
-        
-        Move best_move = Move.NullMove;
 
-        Node current = new(ref board, ref Node.Null, ref Node.Null);
-        current.root = current;
 
-        while (timer.MillisecondsElapsedThisTurn < 1000)
-        {
-            if (current.children.Count == 0) // Is leaf node
+            if (best.Key == evaluation) { best = new KeyValuePair<int, Move[]>(evaluation, best.Value.Append(move).ToArray()); }
+            if (myTurn)
             {
-                if (current.visits == 0) // Run rollout
-                {
-                    int depth = 0;
-                    int result = rollout_node(current.board, ref depth);
-
-                    current.value = result;
-                    current.visits += 1;
-
-                    if (current.root != null)
-                    {
-                        current.root.visits += 1;
-                        current.root.value += result;
-                    }
-
-
-                    /*if (current.parent != null)
-                    {
-                        current.parent.visits++;
-                    }*/
-                }
-                else
-                {
-                    extend_node(ref current, board);
-                }
+                if (best.Key < evaluation) { best = new KeyValuePair<int, Move[]>(evaluation, new Move[] { move }); }
+                alpha = Math.Max(best.Key, alpha);
             }
             else
             {
-                current = best_child_ucb(current);
+                if (best.Key > evaluation) { best = new KeyValuePair<int, Move[]>(evaluation, new Move[] { move }); }
+                beta = Math.Min(best.Key, beta);
             }
 
-            
+            if (beta <= alpha) { break; }
         }
 
-        Console.WriteLine(current.root.children.Count);
+        return best;
+    }
+    public Move Think(Board board, Timer timer)
+    {
+        MoveTranspositionTable.Clear();
 
-        //return board.GetLegalMoves()[random.Next(0, board.GetLegalMoves().Length - 1)];
-        return best_move;
+        entries = 0;
+        ulong debugBitboard = 0;
+        Move nextMove = Move.NullMove;
+
+        var result = Evaluate(board, timer, SEARCH_DEPTH, board.IsWhiteToMove);
+        //MoveTranspositionTable.TryAdd(board.GetFenString(), result);
+
+        //Console.WriteLine(result.Value.Length);
+        Console.WriteLine(result.Key);
+        //Console.WriteLine(entries);
+        //Console.WriteLine(transpositionTable.Count());
+        //Console.WriteLine(ScoreTranspositionTable.Count());
+        foreach (Move move in result.Value)
+        { BitboardHelper.SetSquare(ref debugBitboard, move.StartSquare); }
+
+
+        if (nextMove == Move.NullMove)
+        { nextMove = result.Value[0]; }
+
+
+        
+
+        //BitboardHelper.VisualizeBitboard(debugBitboard);
+
+        board.MakeMove(nextMove);
+        boardScore(board, !board.IsWhiteToMove, true);
+        board.UndoMove(nextMove);
+
+
+        return nextMove;
     }
 }
